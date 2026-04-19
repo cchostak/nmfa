@@ -75,6 +75,44 @@ class MainApp {
     '.ts',
     '.tsx',
   ]);
+  private readonly agentActions = new Set([
+    'append_file',
+    'file_outline',
+    'final',
+    'list_files',
+    'read_file',
+    'replace_in_file',
+    'run_npm_script',
+    'search_files',
+    'web_search',
+    'write_file',
+  ]);
+  private readonly actionAliases = new Map([
+    ['answer', 'final'],
+    ['append', 'append_file'],
+    ['cat', 'read_file'],
+    ['create', 'write_file'],
+    ['create_file', 'write_file'],
+    ['edit', 'replace_in_file'],
+    ['grep', 'search_files'],
+    ['ls', 'list_files'],
+    ['npm', 'run_npm_script'],
+    ['open', 'read_file'],
+    ['outline', 'file_outline'],
+    ['patch', 'replace_in_file'],
+    ['read', 'read_file'],
+    ['respond', 'final'],
+    ['rg', 'search_files'],
+    ['ripgrep', 'search_files'],
+    ['run_tests', 'run_npm_script'],
+    ['search', 'search_files'],
+    ['search_web', 'web_search'],
+    ['show', 'read_file'],
+    ['test', 'run_npm_script'],
+    ['tree', 'list_files'],
+    ['web', 'web_search'],
+    ['write', 'write_file'],
+  ]);
 
   constructor() {
     this.init();
@@ -343,7 +381,7 @@ class MainApp {
         stepIndex,
       );
       const rawStep = await ollama.generateJson(prompt);
-      const step = this.parseAgentStep(rawStep);
+      let step = this.parseAgentStep(rawStep);
 
       if (!step) {
         state = 'observing';
@@ -358,6 +396,21 @@ class MainApp {
           `Model returned invalid tool JSON: ${this.truncateObservation(rawStep)}`,
         );
         continue;
+      }
+
+      const originalAction = step.action;
+      step = this.repairAgentStep(step, message, observations);
+      if (step.action !== originalAction) {
+        this.emitAgentActivity({
+          requestId,
+          state,
+          step: stepIndex + 1,
+          title: `Repaired ${originalAction} -> ${step.action}`,
+          detail: this.formatToolArgs(step.args || {}),
+        });
+        observations.push(
+          `Repaired unavailable action "${originalAction}" to "${step.action}".`,
+        );
       }
 
       const policyObservation = this.validateToolPolicy(step, message);
@@ -449,7 +502,8 @@ class MainApp {
       'search the web, or gather repo structure.',
       '',
       'Return exactly one JSON object and no Markdown:',
-      '{"thought":"short reason","action":"tool_name","args":{...}}',
+      '{"thought":"inspect repo","action":"list_files","args":{"path":"."}}',
+      'The action value must be one of the listed actions exactly.',
       '',
       'Available actions:',
       '- list_files: args {"path":"optional relative directory"}',
@@ -473,9 +527,17 @@ class MainApp {
       '  key files, then final with Mermaid or explanation.',
       '- Current/external facts: web_search, then final with links or caveats.',
       '',
+      'Correct examples:',
+      '{"thought":"find chat flow","action":"search_files","args":{"query":"chat","path":"src"}}',
+      '{"thought":"read main IPC","action":"read_file","args":{"path":"src/main.ts"}}',
+      '{"thought":"answer with mermaid","action":"final","args":{"message":"```mermaid\\nsequenceDiagram\\n  User->>App: Ask\\n```"}}',
+      '',
       'Rules for a small model:',
       '- Take one small tool step at a time.',
       '- Prefer search_files before guessing a path.',
+      '- Never invent tools or use action/tool_name placeholders.',
+      '- Do not use graphviz, dot, bash, shell, curl, or unlisted commands.',
+      '- For diagrams, inspect files and return Mermaid text in final.',
       '- For local code, repo, file, flow, bug, edit, or architecture questions,',
       '  never use web_search. Use search_files, list_files, file_outline,',
       '  and read_file.',
@@ -530,6 +592,15 @@ class MainApp {
   }
 
   private validateToolPolicy(step: AgentStep, userMessage: string): string | null {
+    if (!this.agentActions.has(step.action)) {
+      return [
+        `Action "${step.action}" is unavailable.`,
+        'Choose one listed action: list_files, read_file, search_files,',
+        'file_outline, write_file, replace_in_file, append_file,',
+        'run_npm_script, web_search, or final.',
+      ].join(' ');
+    }
+
     if (step.action !== 'web_search') {
       return null;
     }
@@ -561,21 +632,142 @@ class MainApp {
     }
 
     try {
-      const parsed = JSON.parse(jsonText) as AgentStep;
-      if (!parsed || typeof parsed.action !== 'string') {
+      const parsed = JSON.parse(jsonText) as Record<string, unknown>;
+      const rawAction = this.extractActionName(parsed);
+      if (!rawAction) {
         return null;
       }
 
       return {
         thought: typeof parsed.thought === 'string' ? parsed.thought : '',
-        action: parsed.action,
-        args: parsed.args && typeof parsed.args === 'object' ?
-          parsed.args :
-          {},
+        action: this.normalizeActionName(rawAction),
+        args: this.extractStepArgs(parsed),
       };
     } catch {
       return null;
     }
+  }
+
+  private extractActionName(parsed: Record<string, unknown>): string | null {
+    const action = this.extractString(parsed.action);
+    if (action && action !== 'tool_name') {
+      return action;
+    }
+
+    const fallbacks = [
+      parsed.tool,
+      parsed.tool_name,
+      parsed.name,
+    ];
+    for (const candidate of fallbacks) {
+      const name = this.extractString(candidate);
+      if (name) {
+        return name;
+      }
+    }
+
+    return action;
+  }
+
+  private extractString(value: unknown): string | null {
+    return typeof value === 'string' && value.trim() ? value.trim() : null;
+  }
+
+  private normalizeActionName(action: string): string {
+    const normalized = action.toLowerCase().trim().replace(/[\s-]+/g, '_');
+    return this.actionAliases.get(normalized) || normalized;
+  }
+
+  private extractStepArgs(parsed: Record<string, unknown>): Record<string, unknown> {
+    if (
+      parsed.args &&
+      typeof parsed.args === 'object' &&
+      !Array.isArray(parsed.args)
+    ) {
+      return parsed.args as Record<string, unknown>;
+    }
+
+    const args: Record<string, unknown> = {};
+    const metadataKeys = new Set([
+      'action',
+      'args',
+      'name',
+      'thought',
+      'tool',
+      'tool_name',
+    ]);
+    for (const [key, value] of Object.entries(parsed)) {
+      if (!metadataKeys.has(key)) {
+        args[key] = value;
+      }
+    }
+
+    return args;
+  }
+
+  private repairAgentStep(
+    step: AgentStep,
+    userMessage: string,
+    observations: string[],
+  ): AgentStep {
+    if (this.agentActions.has(step.action)) {
+      return step;
+    }
+
+    const action = step.action.toLowerCase();
+    const message = userMessage.toLowerCase();
+    const wantsDiagram =
+      message.includes('diagram') ||
+      message.includes('mermaid') ||
+      message.includes('sequence');
+    const inspectedWorkspace = observations.some((observation) =>
+      observation.includes('Listed files under') ||
+      observation.includes('Outline for') ||
+      observation.includes('Read '),
+    );
+
+    if (wantsDiagram && !inspectedWorkspace) {
+      return {
+        thought: 'inspect workspace files before composing a Mermaid diagram',
+        action: 'list_files',
+        args: { path: '.' },
+      };
+    }
+
+    if (
+      action.includes('graphviz') ||
+      action === 'dot' ||
+      action.includes('shell') ||
+      action.includes('bash') ||
+      action.includes('command')
+    ) {
+      return {
+        thought: 'external commands are unavailable; inspect the repo instead',
+        action: inspectedWorkspace ? 'search_files' : 'list_files',
+        args: inspectedWorkspace ?
+          { query: this.inferSearchQuery(userMessage), path: '.' } :
+          { path: '.' },
+      };
+    }
+
+    return step;
+  }
+
+  private inferSearchQuery(userMessage: string): string {
+    const compact = userMessage
+      .replace(/[^A-Za-z0-9_./ -]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!compact) {
+      return 'main';
+    }
+
+    const keywords = compact
+      .split(' ')
+      .filter((word) => word.length > 3)
+      .slice(-4)
+      .join(' ');
+    return keywords || compact.slice(0, 80);
   }
 
   private extractJsonObject(rawText: string): string | null {
