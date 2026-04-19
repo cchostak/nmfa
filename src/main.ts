@@ -416,24 +416,66 @@ class MainApp {
         stepIndex,
       );
       const rawStep = await ollama.generateJson(prompt);
+      let step: AgentStep | null = null;
       if (this.isModelError(rawStep)) {
-        state = 'done';
-        this.emitAgentActivity({
-          requestId,
-          state: 'error',
-          step: stepIndex + 1,
-          title: 'Model error',
-          detail: this.truncateObservation(rawStep),
-        });
-        return await this.createModelErrorFallbackResponse(
+        step = await this.createFallbackStepForInvalidModelOutput(
           message,
-          rawStep,
           observations,
           lastToolResult,
         );
+        if (step) {
+          this.emitAgentActivity({
+            requestId,
+            state,
+            step: stepIndex + 1,
+            title: `Recovered model error -> ${step.action}`,
+            detail: this.formatToolArgs(step.args || {}),
+          });
+          observations.push(
+            `Recovered model error "${rawStep}" into ${this.formatToolSignature(step)}.`,
+          );
+        } else {
+          state = 'done';
+          this.emitAgentActivity({
+            requestId,
+            state: 'error',
+            step: stepIndex + 1,
+            title: 'Model error',
+            detail: this.truncateObservation(rawStep),
+          });
+          return await this.createModelErrorFallbackResponse(
+            message,
+            rawStep,
+            observations,
+            lastToolResult,
+          );
+        }
       }
 
-      let step = this.parseAgentStep(rawStep);
+      if (!step) {
+        step = this.parseAgentStep(rawStep);
+      }
+
+      if (!step) {
+        const fallbackStep = await this.createFallbackStepForInvalidModelOutput(
+          message,
+          observations,
+          lastToolResult,
+        );
+        if (fallbackStep) {
+          step = fallbackStep;
+          this.emitAgentActivity({
+            requestId,
+            state,
+            step: stepIndex + 1,
+            title: `Recovered invalid JSON -> ${step.action}`,
+            detail: this.formatToolArgs(step.args || {}),
+          });
+          observations.push(
+            `Recovered invalid model JSON into ${this.formatToolSignature(step)}.`,
+          );
+        }
+      }
 
       if (!step) {
         state = 'observing';
@@ -584,6 +626,8 @@ class MainApp {
       '- Make an edit: search_files/list_files, read_file, replace_in_file or',
       '  write_file, run_npm_script with lint/build/test when relevant, final.',
       '- Create a file: write_file, run_npm_script when relevant, final.',
+      '- Create README/docs from code: read_file the source, write_file the',
+      '  README content, final. Never final before write_file.',
       '- Explain repo architecture or diagrams: list_files, file_outline/read_file',
       '  key files, then final with Mermaid or explanation.',
       '- Current/external facts: web_search, then final with links or caveats.',
@@ -709,6 +753,263 @@ class MainApp {
     return lines.join('\n');
   }
 
+  private async createFallbackStepForInvalidModelOutput(
+    userMessage: string,
+    observations: string[],
+    lastToolResult: ToolResult | null,
+  ): Promise<AgentStep | null> {
+    if (!this.isReadmeCreationRequest(userMessage)) {
+      return null;
+    }
+
+    if (this.hasWrittenReadme(observations)) {
+      return {
+        thought: 'README was written; report completion',
+        action: 'final',
+        args: { message: this.createReadmeCompletionMessage(observations) },
+      };
+    }
+
+    if (lastToolResult?.content && lastToolResult.filePath) {
+      const relativePath = path.relative(
+        this.workspaceRoot || path.dirname(lastToolResult.filePath),
+        lastToolResult.filePath,
+      );
+      const readmePath = this.createReadmePathForSource(relativePath);
+      return {
+        thought: 'write README from observed source',
+        action: 'write_file',
+        args: {
+          path: readmePath,
+          content: this.composeReadmeFromSource(
+            relativePath,
+            lastToolResult.content,
+          ),
+          overwrite: true,
+        },
+      };
+    }
+
+    const sourcePath = await this.findReadmeSourcePath(userMessage);
+    if (sourcePath) {
+      return {
+        thought: 'read source file before writing README',
+        action: 'read_file',
+        args: { path: sourcePath },
+      };
+    }
+
+    return {
+      thought: 'search for deployment source before writing README',
+      action: 'search_files',
+      args: {
+        query: userMessage.toLowerCase().includes('cdk') ? 'aws_cdk' : 'deployment',
+        path: '.',
+      },
+    };
+  }
+
+  private isReadmeCreationRequest(userMessage: string): boolean {
+    const message = userMessage.toLowerCase();
+    return (
+      message.includes('readme') ||
+      message.includes('documentation') ||
+      message.includes('docs')
+    ) && (
+      message.includes('make') ||
+      message.includes('create') ||
+      message.includes('write') ||
+      message.includes('generate')
+    );
+  }
+
+  private hasWrittenReadme(observations: string[]): boolean {
+    return observations.some((observation) =>
+      /^Wrote .*readme.*\.md\./im.test(observation),
+    );
+  }
+
+  private createReadmeCompletionMessage(observations: string[]): string {
+    const wrote = observations.find((observation) =>
+      /^Wrote .*readme.*\.md\./im.test(observation),
+    );
+    return wrote || 'Created the README.';
+  }
+
+  private async findReadmeSourcePath(userMessage: string): Promise<string | null> {
+    const memory = await this.ensureWorkspaceMemory();
+    if (!memory) {
+      return null;
+    }
+
+    const message = userMessage.toLowerCase();
+    const candidates = memory.files
+      .filter((file) => file.language !== 'markdown')
+      .map((file) => ({
+        path: file.path,
+        score: this.scoreReadmeSourceCandidate(file, message),
+      }))
+      .filter((candidate) => candidate.score > 0)
+      .sort((left, right) =>
+        right.score - left.score ||
+        left.path.localeCompare(right.path),
+      );
+
+    return candidates[0]?.path || null;
+  }
+
+  private scoreReadmeSourceCandidate(
+    file: WorkspaceMemoryFile,
+    message: string,
+  ): number {
+    const normalizedPath = file.path.toLowerCase();
+    const joined = [
+      file.path,
+      file.role,
+      ...file.imports,
+      ...file.symbols,
+      ...file.routes,
+    ].join(' ').toLowerCase();
+    let score = 0;
+
+    if (message.includes('cdk') &&
+        (joined.includes('aws_cdk') || joined.includes('aws-cdk') ||
+        normalizedPath.includes('cdk'))) {
+      score += 100;
+    }
+    if (message.includes('deployment') &&
+        (file.role === 'deployment' || normalizedPath.includes('deployment'))) {
+      score += 80;
+    }
+    if (file.role === 'entrypoint') {
+      score += 30;
+    }
+    if (file.role === 'deployment') {
+      score += 25;
+    }
+    if (['python', 'typescript', 'javascript'].includes(file.language)) {
+      score += 10;
+    }
+    if (normalizedPath.includes('test') || normalizedPath.includes('__tests__')) {
+      score -= 60;
+    }
+
+    return score;
+  }
+
+  private createReadmePathForSource(relativeSourcePath: string): string {
+    const directory = path.dirname(relativeSourcePath);
+    if (directory && directory !== '.') {
+      return path.join(directory, 'README.md');
+    }
+
+    return 'README.md';
+  }
+
+  private composeReadmeFromSource(
+    relativeSourcePath: string,
+    sourceContent: string,
+  ): string {
+    const title = this.createReadmeTitle(relativeSourcePath, sourceContent);
+    const resources = this.extractDeploymentResources(sourceContent);
+    const stackName = this.extractFirstMatch(
+      sourceContent,
+      /class\s+([A-Za-z0-9_]+)\s*\(/,
+    );
+    const envVars = this.extractMatches(
+      sourceContent,
+      /os\.environ\.get\(\s*['"]([A-Z0-9_]+)['"]/g,
+    );
+
+    const overview = [
+      `This document describes the deployment defined in \`${relativeSourcePath}\`.`,
+    ];
+    if (stackName) {
+      overview.push(`The primary CDK stack is \`${stackName}\`.`);
+    }
+
+    return [
+      `# ${title}`,
+      '',
+      '## Overview',
+      '',
+      ...overview,
+      '',
+      '## Provisioned Resources',
+      '',
+      resources.length > 0 ?
+        resources.map((resource) => `- ${resource}`).join('\n') :
+        '- Review the CDK source for the full resource list.',
+      '',
+      '## Configuration',
+      '',
+      envVars.length > 0 ?
+        envVars.map((envVar) => `- \`${envVar}\``).join('\n') :
+        '- No environment variables were detected in the deployment source.',
+      '',
+      '## Deploy',
+      '',
+      '```bash',
+      'cd deployment',
+      'cdk deploy',
+      '```',
+      '',
+      '## Notes',
+      '',
+      '- Run `cdk diff` before deploying changes.',
+      '- Verify AWS credentials and the target account before deployment.',
+      '- Keep resource names, permissions, and environment-specific values configurable.',
+      '',
+    ].join('\n');
+  }
+
+  private createReadmeTitle(relativeSourcePath: string, sourceContent: string): string {
+    if (relativeSourcePath.toLowerCase().includes('cdk') ||
+        sourceContent.toLowerCase().includes('aws_cdk')) {
+      return 'CDK Deployment';
+    }
+
+    return 'Deployment';
+  }
+
+  private extractDeploymentResources(sourceContent: string): string[] {
+    const resourcePattern = /([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\(/g;
+    const resources = new Set<string>();
+    for (const match of sourceContent.matchAll(resourcePattern)) {
+      const moduleName = match[1];
+      const constructName = match[2];
+      const description = this.describeDeploymentResource(moduleName, constructName);
+      if (description) {
+        resources.add(description);
+      }
+    }
+
+    return Array.from(resources).sort();
+  }
+
+  private describeDeploymentResource(
+    moduleName: string,
+    constructName: string,
+  ): string | null {
+    const key = `${moduleName}.${constructName}`;
+    const descriptions: Record<string, string> = {
+      'dynamodb.Attribute': 'DynamoDB table schema attributes.',
+      'dynamodb.Table': 'DynamoDB table for persistent application data.',
+      'ecs.Cluster': 'ECS cluster for running containerized services.',
+      'ecs_patterns.ApplicationLoadBalancedFargateService':
+        'Application Load Balanced Fargate service.',
+      's3.Bucket': 'S3 bucket for object storage.',
+      'sns.Topic': 'SNS topic for notifications or verification events.',
+      'sqs.Queue': 'SQS queue for asynchronous work.',
+    };
+
+    return descriptions[key] || null;
+  }
+
+  private extractFirstMatch(content: string, pattern: RegExp): string | null {
+    return content.match(pattern)?.[1] || null;
+  }
+
   private formatToolArgs(args: Record<string, unknown>): string {
     const redacted = Object.fromEntries(
       Object.entries(args).map(([key, value]) => {
@@ -790,8 +1091,30 @@ class MainApp {
         args: this.extractStepArgs(parsed),
       };
     } catch {
+      return this.parseLooseAgentStep(jsonText);
+    }
+  }
+
+  private parseLooseAgentStep(jsonText: string): AgentStep | null {
+    const action = jsonText.match(/"action"\s*:\s*"([^"]+)"/)?.[1];
+    if (!action) {
       return null;
     }
+
+    const thought = jsonText.match(/"thought"\s*:\s*"([^"]*)"/)?.[1] || '';
+    const messageMatch = jsonText.match(/"message"\s*:\s*"([\s\S]*?)"\s*}\s*}/);
+    const args: Record<string, unknown> = {};
+    if (messageMatch?.[1]) {
+      args.message = messageMatch[1]
+        .replace(/\r?\n/g, '\n')
+        .replace(/\\"/g, '"');
+    }
+
+    return {
+      thought,
+      action: this.normalizeActionName(action),
+      args,
+    };
   }
 
   private extractActionName(parsed: Record<string, unknown>): string | null {
@@ -857,6 +1180,15 @@ class MainApp {
     observations: string[],
   ): Promise<AgentStep> {
     if (this.agentActions.has(step.action)) {
+      const prematureFinalRepair = await this.repairPrematureFinalStep(
+        step,
+        userMessage,
+        observations,
+      );
+      if (prematureFinalRepair) {
+        return prematureFinalRepair;
+      }
+
       const fileTargetRepair = await this.repairFileTargetStep(step, userMessage);
       return fileTargetRepair || step;
     }
@@ -898,6 +1230,38 @@ class MainApp {
     }
 
     return step;
+  }
+
+  private async repairPrematureFinalStep(
+    step: AgentStep,
+    userMessage: string,
+    observations: string[],
+  ): Promise<AgentStep | null> {
+    if (step.action !== 'final' || !this.isReadmeCreationRequest(userMessage)) {
+      return null;
+    }
+
+    if (this.hasWrittenReadme(observations)) {
+      return null;
+    }
+
+    const sourcePath = await this.findReadmeSourcePath(userMessage);
+    if (!sourcePath) {
+      return {
+        thought: 'find source file before writing README',
+        action: 'search_files',
+        args: {
+          query: userMessage.toLowerCase().includes('cdk') ? 'aws_cdk' : 'deployment',
+          path: '.',
+        },
+      };
+    }
+
+    return {
+      thought: 'read source before writing README',
+      action: 'read_file',
+      args: { path: sourcePath },
+    };
   }
 
   private async repairFileTargetStep(
