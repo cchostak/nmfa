@@ -72,8 +72,14 @@ class MainApp {
     '.json',
     '.md',
     '.mjs',
+    '.py',
+    '.sh',
+    '.toml',
     '.ts',
     '.tsx',
+    '.txt',
+    '.yaml',
+    '.yml',
   ]);
   private readonly agentActions = new Set([
     'append_file',
@@ -173,7 +179,9 @@ class MainApp {
         filters: [
           { name: 'TypeScript', extensions: ['ts', 'tsx'] },
           { name: 'JavaScript', extensions: ['js', 'jsx'] },
+          { name: 'Python', extensions: ['py'] },
           { name: 'Web Files', extensions: ['html', 'css', 'json', 'md'] },
+          { name: 'Config', extensions: ['toml', 'yaml', 'yml'] },
           { name: 'All Files', extensions: ['*'] },
         ],
       });
@@ -453,7 +461,7 @@ class MainApp {
         title: `Running ${step.action}`,
         detail: this.formatToolArgs(step.args || {}),
       });
-      const toolResult = await this.executeAgentTool(step);
+      const toolResult = await this.executeAgentToolSafely(step);
       lastToolResult = toolResult;
       state = 'observing';
       this.emitAgentActivity({
@@ -504,6 +512,7 @@ class MainApp {
       'Return exactly one JSON object and no Markdown:',
       '{"thought":"inspect repo","action":"list_files","args":{"path":"."}}',
       'The action value must be one of the listed actions exactly.',
+      'Never copy example paths. Use paths from workspace summary or observations.',
       '',
       'Available actions:',
       '- list_files: args {"path":"optional relative directory"}',
@@ -528,8 +537,8 @@ class MainApp {
       '- Current/external facts: web_search, then final with links or caveats.',
       '',
       'Correct examples:',
-      '{"thought":"find chat flow","action":"search_files","args":{"query":"chat","path":"src"}}',
-      '{"thought":"read main IPC","action":"read_file","args":{"path":"src/main.ts"}}',
+      '{"thought":"find chat flow","action":"search_files","args":{"query":"chat","path":"."}}',
+      '{"thought":"read observed file","action":"read_file","args":{"path":"README.md"}}',
       '{"thought":"answer with mermaid","action":"final","args":{"message":"```mermaid\\nsequenceDiagram\\n  User->>App: Ask\\n```"}}',
       '',
       'Rules for a small model:',
@@ -828,6 +837,41 @@ class MainApp {
     }
   }
 
+  private async executeAgentToolSafely(step: AgentStep): Promise<ToolResult> {
+    try {
+      return await this.executeAgentTool(step);
+    } catch (error) {
+      return {
+        observation: await this.createToolErrorObservation(step, error),
+      };
+    }
+  }
+
+  private async createToolErrorObservation(
+    step: AgentStep,
+    error: unknown,
+  ): Promise<string> {
+    const message = error instanceof Error ? error.message : String(error);
+    const requestedPath = this.getStringArg(step, 'path');
+    const lines = [
+      `Tool ${step.action} failed: ${message}`,
+    ];
+
+    if (requestedPath && this.workspaceRoot) {
+      lines.push(`Requested path: ${requestedPath}`);
+      const candidates = await this.findSimilarWorkspaceFiles(requestedPath);
+      if (candidates.length > 0) {
+        lines.push('Closest workspace files:');
+        lines.push(...candidates.map((filePath) => `- ${filePath}`));
+      }
+    }
+
+    lines.push(
+      'Recover by using list_files or search_files, then read an observed path.',
+    );
+    return lines.join('\n');
+  }
+
   private getStringArg(step: AgentStep, name: string): string | null {
     const value = step.args?.[name];
     return typeof value === 'string' && value.trim() ? value.trim() : null;
@@ -962,25 +1006,45 @@ class MainApp {
     );
     const content = await this.readTextFile(filePath);
     const relativePath = path.relative(this.workspaceRoot, filePath);
-    const imports = this.extractMatches(
-      content,
-      /^\s*import\s+.+?from\s+['"](.+?)['"];?/gm,
-    );
+    const extension = path.extname(relativePath).toLowerCase();
+    const imports = extension === '.py' ?
+      this.extractMatches(
+        content,
+        /^\s*(?:from\s+([A-Za-z0-9_.]+)\s+import|import\s+([A-Za-z0-9_.]+))/gm,
+      ) :
+      this.extractMatches(
+        content,
+        /^\s*import\s+.+?from\s+['"](.+?)['"];?/gm,
+      );
     const classes = this.extractMatches(
       content,
       /^\s*(?:export\s+)?class\s+([A-Za-z0-9_]+)/gm,
     );
-    const functions = this.extractMatches(
-      content,
-      /^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z0-9_]+)/gm,
-    );
-    const methods = this.extractMatches(
-      content,
-      /^\s*(?:private|public|protected)?\s*(?:async\s+)?([A-Za-z0-9_]+)\([^)]*\)\s*[:{]/gm,
-    ).filter((name) => !['if', 'for', 'while', 'switch'].includes(name));
+    const functions = extension === '.py' ?
+      this.extractMatches(
+        content,
+        /^\s*(?:async\s+)?def\s+([A-Za-z0-9_]+)\s*\(/gm,
+      ) :
+      this.extractMatches(
+        content,
+        /^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z0-9_]+)/gm,
+      );
+    const methods = extension === '.py' ?
+      this.extractMatches(
+        content,
+        /^\s+(?:async\s+)?def\s+([A-Za-z0-9_]+)\s*\(/gm,
+      ) :
+      this.extractMatches(
+        content,
+        /^\s*(?:private|public|protected)?\s*(?:async\s+)?([A-Za-z0-9_]+)\([^)]*\)\s*[:{]/gm,
+      ).filter((name) => !['if', 'for', 'while', 'switch'].includes(name));
     const ipcHandlers = this.extractMatches(
       content,
       /ipcMain\.handle\(\s*['"](.+?)['"]/gm,
+    );
+    const routes = this.extractMatches(
+      content,
+      /^\s*@\w+\.(?:get|post|put|patch|delete)\(\s*['"](.+?)['"]/gm,
     );
 
     return {
@@ -991,6 +1055,7 @@ class MainApp {
         `functions: ${functions.slice(0, 12).join(', ') || 'none'}`,
         `methods: ${methods.slice(0, 20).join(', ') || 'none'}`,
         `ipc handlers: ${ipcHandlers.slice(0, 20).join(', ') || 'none'}`,
+        `routes: ${routes.slice(0, 20).join(', ') || 'none'}`,
       ].join('\n'),
       content,
       filePath,
@@ -1242,8 +1307,9 @@ class MainApp {
   private extractMatches(content: string, pattern: RegExp): string[] {
     const matches: string[] = [];
     for (const match of content.matchAll(pattern)) {
-      if (match[1]) {
-        matches.push(match[1]);
+      const value = match.slice(1).find((group) => Boolean(group));
+      if (value) {
+        matches.push(value);
       }
     }
 
@@ -1520,6 +1586,68 @@ class MainApp {
     }
 
     return files;
+  }
+
+  private async findSimilarWorkspaceFiles(requestedPath: string): Promise<string[]> {
+    if (!this.workspaceRoot) {
+      return [];
+    }
+
+    const files = await this.collectWorkspaceFiles(this.workspaceRoot);
+    const requested = requestedPath.toLowerCase();
+    const requestedBase = path.basename(requested);
+    const requestedStem = requestedBase.replace(path.extname(requestedBase), '');
+    const requestedParts = requested.split(/[\\/]+/).filter(Boolean);
+    const scored = files
+      .map((filePath) => path.relative(this.workspaceRoot!, filePath))
+      .map((filePath) => ({
+        filePath,
+        score: this.scoreSimilarPath(
+          filePath.toLowerCase(),
+          requestedBase,
+          requestedStem,
+          requestedParts,
+        ),
+      }))
+      .filter((candidate) => candidate.score > 0)
+      .sort((left, right) =>
+        right.score - left.score ||
+        left.filePath.localeCompare(right.filePath),
+      );
+
+    return scored.slice(0, 6).map((candidate) => candidate.filePath);
+  }
+
+  private scoreSimilarPath(
+    candidatePath: string,
+    requestedBase: string,
+    requestedStem: string,
+    requestedParts: string[],
+  ): number {
+    const candidateBase = path.basename(candidatePath);
+    const candidateStem = candidateBase.replace(path.extname(candidateBase), '');
+    let score = 0;
+
+    if (candidateBase === requestedBase) {
+      score += 20;
+    }
+    if (requestedStem && candidateStem === requestedStem) {
+      score += 12;
+    }
+    if (requestedBase && candidatePath.includes(requestedBase)) {
+      score += 8;
+    }
+    if (requestedStem && candidatePath.includes(requestedStem)) {
+      score += 5;
+    }
+
+    for (const part of requestedParts) {
+      if (part.length > 2 && candidatePath.includes(part)) {
+        score += 1;
+      }
+    }
+
+    return score;
   }
 
   private async buildWorkspaceTree(
