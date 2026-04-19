@@ -49,6 +49,61 @@
         height: calc(100vh - 92px);
       }
 
+      #file-sidebar {
+        width: 260px;
+        min-width: 220px;
+        max-width: 340px;
+        overflow: auto;
+        background: #151515;
+        border-right: 1px solid #333;
+      }
+
+      #file-sidebar-header {
+        padding: 10px 12px;
+        color: #d8d8d8;
+        font-size: 13px;
+        font-weight: 600;
+        border-bottom: 1px solid #333;
+      }
+
+      #file-tree {
+        padding: 6px 0 12px;
+      }
+
+      .file-tree-empty {
+        padding: 10px 12px;
+        color: #9a9a9a;
+        font-size: 13px;
+      }
+
+      .tree-node {
+        display: block;
+        width: 100%;
+        min-height: 28px;
+        overflow: hidden;
+        color: #d8d8d8;
+        background: transparent;
+        border: 0;
+        border-radius: 0;
+        cursor: pointer;
+        font: inherit;
+        font-size: 13px;
+        line-height: 28px;
+        text-align: left;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .tree-node-directory {
+        color: #f0f0f0;
+        cursor: default;
+      }
+
+      .tree-node-file:hover,
+      .tree-node.active {
+        background: #273241;
+      }
+
       #editor {
         flex: 1;
         border-right: 1px solid #333;
@@ -80,16 +135,14 @@
     </div>
 
     <div class="workspace">
+      <aside id="file-sidebar">
+        <div id="file-sidebar-header">Explorer</div>
+        <div id="file-tree">
+          <div class="file-tree-empty">Open a folder to browse files</div>
+        </div>
+      </aside>
       <div id="editor"></div>
       <div id="chat-container"></div>
     </div>
-
-    <script>
-      if (typeof require === 'function') {
-        require('./renderer.js');
-      } else {
-        console.error('Unable to load renderer: require is not available.');
-      }
-    </script>
   </body>
 </html>
