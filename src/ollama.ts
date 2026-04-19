@@ -117,7 +117,7 @@ export class OllamaService {
 
   private formatError(error: unknown): string {
     if (error instanceof Error && error.name === 'AbortError') {
-      return 'Error: Ollama did not respond within 20 seconds.';
+      return `Error: Ollama did not respond within ${Math.ceil(this.requestTimeoutMs / 1000)} seconds.`;
     }
 
     if (error instanceof Error) {

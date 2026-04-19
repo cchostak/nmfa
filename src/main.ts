@@ -1,5 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain } from 'electron';
 import { spawn, ChildProcess } from 'child_process';
+import { createHash } from 'crypto';
 import * as path from 'path';
 import { constants as fsConstants } from 'fs';
 import * as fs from 'fs/promises';
@@ -44,6 +45,28 @@ type AgentActivityEvent = {
   detail?: string;
 };
 
+type WorkspaceMemoryFile = {
+  path: string;
+  language: string;
+  role: string;
+  size: number;
+  imports: string[];
+  symbols: string[];
+  routes: string[];
+};
+
+type WorkspaceMemory = {
+  version: number;
+  workspaceRoot: string;
+  updatedAt: string;
+  languages: string[];
+  frameworks: string[];
+  importantFiles: string[];
+  readmePath?: string;
+  readmeExcerpt?: string;
+  files: WorkspaceMemoryFile[];
+};
+
 /**
  * Main entry point for the Electron application.
  * Handles window creation, local file access, and model startup.
@@ -54,9 +77,11 @@ class MainApp {
   private modelStartError: string | null = null;
   private modelReady = false;
   private workspaceRoot: string | null = null;
+  private workspaceMemory: WorkspaceMemory | null = null;
   private readonly maxTreeEntries = 500;
   private readonly maxAgentFileBytes = 12000;
   private readonly ignoredFolderNames = new Set([
+    '.nmfa',
     '.git',
     'build',
     'coverage',
@@ -191,6 +216,7 @@ class MainApp {
         try {
           const content = await this.readTextFile(selectedPath);
           this.workspaceRoot = path.dirname(selectedPath);
+          await this.refreshWorkspaceMemory();
           const tree = await this.buildWorkspaceTree(this.workspaceRoot);
           return {
             success: true,
@@ -217,6 +243,7 @@ class MainApp {
         const selectedPath = result.filePaths[0];
         try {
           this.workspaceRoot = selectedPath;
+          await this.refreshWorkspaceMemory();
           const tree = await this.buildWorkspaceTree(selectedPath);
           const filePath = await this.findFirstSupportedFile(selectedPath);
           if (!filePath) {
@@ -389,6 +416,23 @@ class MainApp {
         stepIndex,
       );
       const rawStep = await ollama.generateJson(prompt);
+      if (this.isModelError(rawStep)) {
+        state = 'done';
+        this.emitAgentActivity({
+          requestId,
+          state: 'error',
+          step: stepIndex + 1,
+          title: 'Model error',
+          detail: this.truncateObservation(rawStep),
+        });
+        return await this.createModelErrorFallbackResponse(
+          message,
+          rawStep,
+          observations,
+          lastToolResult,
+        );
+      }
+
       let step = this.parseAgentStep(rawStep);
 
       if (!step) {
@@ -406,18 +450,20 @@ class MainApp {
         continue;
       }
 
-      const originalAction = step.action;
-      step = this.repairAgentStep(step, message, observations);
-      if (step.action !== originalAction) {
+      const originalStep = step;
+      const originalSignature = this.formatToolSignature(step);
+      step = await this.repairAgentStep(step, message, observations);
+      const repairedSignature = this.formatToolSignature(step);
+      if (repairedSignature !== originalSignature) {
         this.emitAgentActivity({
           requestId,
           state,
           step: stepIndex + 1,
-          title: `Repaired ${originalAction} -> ${step.action}`,
+          title: `Repaired ${originalStep.action} -> ${step.action}`,
           detail: this.formatToolArgs(step.args || {}),
         });
         observations.push(
-          `Repaired unavailable action "${originalAction}" to "${step.action}".`,
+          `Repaired tool call ${originalSignature} to ${repairedSignature}.`,
         );
       }
 
@@ -501,7 +547,11 @@ class MainApp {
     const workspaceSummary = this.workspaceRoot ?
       await this.createToolWorkspaceSummary() :
       'No workspace is open.';
+    const workspaceMemory = this.workspaceRoot ?
+      await this.formatWorkspaceMemoryForPrompt() :
+      'No workspace memory is available.';
     const safeHistory = Array.isArray(history) ? history.slice(-6) : [];
+    const observationContext = this.formatObservationsForPrompt(observations);
 
     return [
       'You are NMFA, an agentic coding assistant inside a local IDE.',
@@ -528,6 +578,8 @@ class MainApp {
       '',
       'Developer flows:',
       '- Understand a file: file_outline, read_file, final.',
+      '- Understand a repo: list_files, read_file README.md if present,',
+      '  file_outline likely entrypoint files, final.',
       '- Find code: search_files, read_file the best matches, final.',
       '- Make an edit: search_files/list_files, read_file, replace_in_file or',
       '  write_file, run_npm_script with lint/build/test when relevant, final.',
@@ -544,6 +596,7 @@ class MainApp {
       'Rules for a small model:',
       '- Take one small tool step at a time.',
       '- Prefer search_files before guessing a path.',
+      '- file_outline requires a file path; never use "." or a directory.',
       '- Never invent tools or use action/tool_name placeholders.',
       '- Do not use graphviz, dot, bash, shell, curl, or unlisted commands.',
       '- For diagrams, inspect files and return Mermaid text in final.',
@@ -566,6 +619,9 @@ class MainApp {
       'Workspace summary:',
       workspaceSummary,
       '',
+      'Workspace memory:',
+      workspaceMemory,
+      '',
       'Active editor contents:',
       activeCode || '[empty]',
       '',
@@ -573,7 +629,7 @@ class MainApp {
       JSON.stringify(safeHistory),
       '',
       'Tool observations so far:',
-      observations.length > 0 ? observations.join('\n---\n') : '[none]',
+      observationContext,
       '',
       `User request: ${message}`,
     ].join('\n');
@@ -587,6 +643,72 @@ class MainApp {
     return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   }
 
+  private isModelError(output: string): boolean {
+    return output.trim().startsWith('Error:');
+  }
+
+  private async createModelErrorFallbackResponse(
+    message: string,
+    modelError: string,
+    observations: string[],
+    lastToolResult: ToolResult | null,
+  ): Promise<AgentResponse> {
+    const memory = await this.ensureWorkspaceMemory();
+    const normalizedMessage = message.toLowerCase();
+    const canUseMemory =
+      Boolean(memory) &&
+      (
+        normalizedMessage.includes('what') ||
+        normalizedMessage.includes('about') ||
+        normalizedMessage.includes('overview') ||
+        normalizedMessage.includes('summary')
+      );
+    const fallbackMessage = canUseMemory && memory ?
+      this.createWorkspaceOverviewFromMemory(memory, modelError) :
+      [
+        `The model stopped with: ${modelError}`,
+        'I stopped the loop instead of retrying blindly.',
+        'Latest observations:',
+        ...observations.slice(-4).map((observation) => `- ${observation}`),
+      ].join('\n');
+
+    return {
+      message: fallbackMessage,
+      content: lastToolResult?.content,
+      filePath: lastToolResult?.filePath,
+      workspace: this.workspaceRoot,
+      tree: lastToolResult?.tree,
+    };
+  }
+
+  private createWorkspaceOverviewFromMemory(
+    memory: WorkspaceMemory,
+    modelError: string,
+  ): string {
+    const lines = [
+      `The model timed out while planning (${modelError}), so I used the workspace memory index instead.`,
+      '',
+      `Workspace: ${path.basename(memory.workspaceRoot)}`,
+    ];
+    if (memory.languages.length > 0) {
+      lines.push(`Languages: ${memory.languages.join(', ')}`);
+    }
+    if (memory.frameworks.length > 0) {
+      lines.push(`Frameworks/signals: ${memory.frameworks.join(', ')}`);
+    }
+    if (memory.readmeExcerpt) {
+      lines.push('', 'README excerpt:', memory.readmeExcerpt);
+    }
+    if (memory.importantFiles.length > 0) {
+      lines.push('', 'Important files:');
+      lines.push(...memory.importantFiles.slice(0, 8).map((filePath) =>
+        `- ${filePath}`,
+      ));
+    }
+
+    return lines.join('\n');
+  }
+
   private formatToolArgs(args: Record<string, unknown>): string {
     const redacted = Object.fromEntries(
       Object.entries(args).map(([key, value]) => {
@@ -598,6 +720,21 @@ class MainApp {
       }),
     );
     return JSON.stringify(redacted);
+  }
+
+  private formatToolSignature(step: AgentStep): string {
+    return `${step.action} ${this.formatToolArgs(step.args || {})}`;
+  }
+
+  private formatObservationsForPrompt(observations: string[]): string {
+    if (observations.length === 0) {
+      return '[none]';
+    }
+
+    return observations
+      .slice(-5)
+      .map((observation) => this.truncateText(observation, 1600))
+      .join('\n---\n');
   }
 
   private validateToolPolicy(step: AgentStep, userMessage: string): string | null {
@@ -714,13 +851,14 @@ class MainApp {
     return args;
   }
 
-  private repairAgentStep(
+  private async repairAgentStep(
     step: AgentStep,
     userMessage: string,
     observations: string[],
-  ): AgentStep {
+  ): Promise<AgentStep> {
     if (this.agentActions.has(step.action)) {
-      return step;
+      const fileTargetRepair = await this.repairFileTargetStep(step, userMessage);
+      return fileTargetRepair || step;
     }
 
     const action = step.action.toLowerCase();
@@ -760,6 +898,146 @@ class MainApp {
     }
 
     return step;
+  }
+
+  private async repairFileTargetStep(
+    step: AgentStep,
+    userMessage: string,
+  ): Promise<AgentStep | null> {
+    if (!this.workspaceRoot ||
+        !['file_outline', 'read_file'].includes(step.action)) {
+      return null;
+    }
+
+    const requestedPath = this.getStringArg(step, 'path') || '.';
+    let filePath: string;
+    try {
+      filePath = await this.resolveWorkspacePath(
+        path.isAbsolute(requestedPath) ?
+          requestedPath :
+          path.join(this.workspaceRoot, requestedPath),
+      );
+    } catch {
+      return null;
+    }
+
+    try {
+      const stats = await fs.stat(filePath);
+      if (stats.isFile()) {
+        return null;
+      }
+
+      if (stats.isDirectory()) {
+        const selectedFile = await this.chooseUsefulWorkspaceFile(
+          userMessage,
+          filePath,
+        );
+        if (!selectedFile) {
+          return null;
+        }
+
+        return this.createFileTargetRepair(step, userMessage, selectedFile);
+      }
+    } catch {
+      const candidates = await this.findSimilarWorkspaceFiles(requestedPath);
+      if (candidates.length === 0) {
+        return null;
+      }
+
+      return this.createFileTargetRepair(
+        step,
+        userMessage,
+        path.join(this.workspaceRoot, candidates[0]),
+      );
+    }
+
+    return null;
+  }
+
+  private createFileTargetRepair(
+    step: AgentStep,
+    userMessage: string,
+    filePath: string,
+  ): AgentStep {
+    const relativePath = path.relative(this.workspaceRoot!, filePath);
+    return {
+      thought: `use observed file ${relativePath} instead of a directory`,
+      action: this.shouldReadForRequest(userMessage, relativePath) ?
+        'read_file' :
+        step.action,
+      args: { ...step.args, path: relativePath },
+    };
+  }
+
+  private shouldReadForRequest(userMessage: string, relativePath: string): boolean {
+    const message = userMessage.toLowerCase();
+    return relativePath.toLowerCase().endsWith('.md') ||
+      message.includes('what') ||
+      message.includes('about') ||
+      message.includes('overview') ||
+      message.includes('summary');
+  }
+
+  private async chooseUsefulWorkspaceFile(
+    userMessage: string,
+    directoryPath: string,
+  ): Promise<string | null> {
+    const stats = await fs.stat(directoryPath);
+    const searchRoot = stats.isDirectory() ? directoryPath : this.workspaceRoot!;
+    const memory = await this.ensureWorkspaceMemory();
+    const rootRelative = path.relative(this.workspaceRoot!, searchRoot);
+    const memoryFiles = memory?.files
+      .filter((file) => !rootRelative || file.path.startsWith(`${rootRelative}${path.sep}`))
+      .map((file) => path.join(this.workspaceRoot!, file.path)) || [];
+    const files = memoryFiles.length > 0 ?
+      memoryFiles :
+      await this.collectWorkspaceFiles(searchRoot);
+    if (files.length === 0) {
+      return null;
+    }
+
+    const message = userMessage.toLowerCase();
+    const wantsOverview =
+      message.includes('what') ||
+      message.includes('about') ||
+      message.includes('overview') ||
+      message.includes('summary');
+    const scored = files
+      .map((filePath) => ({
+        filePath,
+        score: this.scoreUsefulWorkspaceFile(filePath, wantsOverview),
+      }))
+      .sort((left, right) =>
+        right.score - left.score ||
+        left.filePath.localeCompare(right.filePath),
+      );
+
+    return scored[0]?.filePath || null;
+  }
+
+  private scoreUsefulWorkspaceFile(filePath: string, wantsOverview: boolean): number {
+    const relativePath = path.relative(this.workspaceRoot!, filePath).toLowerCase();
+    const baseName = path.basename(relativePath);
+    const extension = path.extname(baseName);
+    let score = 0;
+
+    if (baseName === 'readme.md') {
+      score += wantsOverview ? 100 : 70;
+    }
+    if (['pyproject.toml', 'package.json', 'cargo.toml'].includes(baseName)) {
+      score += wantsOverview ? 70 : 35;
+    }
+    if (['main.py', 'app.py', 'server.py', 'index.ts', 'main.ts'].includes(baseName)) {
+      score += 60;
+    }
+    if (['.py', '.ts', '.js'].includes(extension)) {
+      score += 15;
+    }
+    if (!relativePath.includes('/__') && !relativePath.includes('/test')) {
+      score += 5;
+    }
+
+    return score;
   }
 
   private inferSearchQuery(userMessage: string): string {
@@ -919,6 +1197,21 @@ class MainApp {
         requestedPath :
         path.join(this.workspaceRoot, requestedPath),
     );
+    const stats = await fs.stat(filePath);
+    if (stats.isDirectory()) {
+      const candidates = await this.findBestFilesInDirectory(filePath);
+      return {
+        observation: [
+          `Path ${path.relative(this.workspaceRoot, filePath) || '.'} is a directory.`,
+          'read_file requires one file path.',
+          candidates.length > 0 ?
+            'Use read_file or file_outline with one of these files:' :
+            'No supported files were found under this directory.',
+          ...candidates.map((candidate) => `- ${candidate}`),
+        ].join('\n'),
+      };
+    }
+
     const content = await this.readTextFile(filePath);
     const relativePath = path.relative(this.workspaceRoot, filePath);
     return {
@@ -1004,6 +1297,21 @@ class MainApp {
         requestedPath :
         path.join(this.workspaceRoot, requestedPath),
     );
+    const stats = await fs.stat(filePath);
+    if (stats.isDirectory()) {
+      const candidates = await this.findBestFilesInDirectory(filePath);
+      return {
+        observation: [
+          `Path ${path.relative(this.workspaceRoot, filePath) || '.'} is a directory.`,
+          'file_outline requires one file path.',
+          candidates.length > 0 ?
+            'Use file_outline or read_file with one of these files:' :
+            'No supported files were found under this directory.',
+          ...candidates.map((candidate) => `- ${candidate}`),
+        ].join('\n'),
+      };
+    }
+
     const content = await this.readTextFile(filePath);
     const relativePath = path.relative(this.workspaceRoot, filePath);
     const extension = path.extname(relativePath).toLowerCase();
@@ -1081,6 +1389,7 @@ class MainApp {
       encoding: 'utf-8',
       flag: overwrite ? 'w' : 'wx',
     });
+    await this.refreshWorkspaceMemory();
     const tree = await this.buildWorkspaceTree(this.workspaceRoot);
     return {
       observation: `Wrote ${path.relative(this.workspaceRoot, filePath)}.`,
@@ -1121,6 +1430,7 @@ class MainApp {
 
     const updatedContent = content.split(findText).join(replaceText);
     await fs.writeFile(filePath, updatedContent, 'utf-8');
+    await this.refreshWorkspaceMemory();
     return {
       observation: `Replaced ${occurrences} occurrence(s) in ${path.relative(this.workspaceRoot, filePath)}.`,
       content: updatedContent,
@@ -1151,6 +1461,7 @@ class MainApp {
     );
     await fs.mkdir(path.dirname(filePath), { recursive: true });
     await fs.appendFile(filePath, content, 'utf-8');
+    await this.refreshWorkspaceMemory();
     const updatedContent = await this.readTextFile(filePath);
     const tree = await this.buildWorkspaceTree(this.workspaceRoot);
     return {
@@ -1235,15 +1546,373 @@ class MainApp {
       return 'No workspace is open.';
     }
 
+    const memory = await this.ensureWorkspaceMemory();
+    if (memory) {
+      const important = memory.importantFiles.slice(0, 12);
+      const rest = memory.files
+        .map((file) => file.path)
+        .filter((filePath) => !important.includes(filePath))
+        .slice(0, 68);
+      return [...important, ...rest]
+        .map((filePath) => `- ${filePath}`)
+        .join('\n');
+    }
+
     const files = await this.collectWorkspaceFiles(this.workspaceRoot);
-    const relativeFiles = files
+    return files
       .map((filePath) => path.relative(this.workspaceRoot!, filePath))
-      .slice(0, 80);
-    return relativeFiles.map((filePath) => `- ${filePath}`).join('\n');
+      .slice(0, 80)
+      .map((filePath) => `- ${filePath}`)
+      .join('\n');
+  }
+
+  private async ensureWorkspaceMemory(): Promise<WorkspaceMemory | null> {
+    if (!this.workspaceRoot) {
+      return null;
+    }
+
+    if (this.workspaceMemory?.workspaceRoot === this.workspaceRoot) {
+      return this.workspaceMemory;
+    }
+
+    const cached = await this.loadWorkspaceMemory();
+    if (cached?.workspaceRoot === this.workspaceRoot) {
+      this.workspaceMemory = cached;
+      return cached;
+    }
+
+    await this.refreshWorkspaceMemory();
+    return this.workspaceMemory;
+  }
+
+  private async refreshWorkspaceMemory(): Promise<void> {
+    if (!this.workspaceRoot) {
+      this.workspaceMemory = null;
+      return;
+    }
+
+    try {
+      const memory = await this.buildWorkspaceMemory();
+      this.workspaceMemory = memory;
+      await this.saveWorkspaceMemory(memory);
+    } catch (error) {
+      console.error('Workspace memory refresh failed:', error);
+    }
+  }
+
+  private async buildWorkspaceMemory(): Promise<WorkspaceMemory> {
+    if (!this.workspaceRoot) {
+      throw new Error('No workspace is open.');
+    }
+
+    const filePaths = await this.collectWorkspaceFiles(this.workspaceRoot);
+    const files: WorkspaceMemoryFile[] = [];
+    for (const filePath of filePaths) {
+      files.push(await this.createWorkspaceMemoryFile(filePath));
+    }
+
+    const languages = Array.from(new Set(files.map((file) => file.language)))
+      .filter((language) => language !== 'unknown')
+      .sort();
+    const frameworks = this.detectWorkspaceFrameworks(files);
+    const readme = files.find((file) => path.basename(file.path).toLowerCase() ===
+      'readme.md');
+    const importantFiles = files
+      .map((file) => ({
+        path: file.path,
+        score: this.scoreMemoryFile(file),
+      }))
+      .sort((left, right) =>
+        right.score - left.score ||
+        left.path.localeCompare(right.path),
+      )
+      .slice(0, 20)
+      .map((file) => file.path);
+
+    return {
+      version: 1,
+      workspaceRoot: this.workspaceRoot,
+      updatedAt: new Date().toISOString(),
+      languages,
+      frameworks,
+      importantFiles,
+      readmePath: readme?.path,
+      readmeExcerpt: readme ?
+        await this.createReadmeExcerpt(path.join(this.workspaceRoot, readme.path)) :
+        undefined,
+      files,
+    };
+  }
+
+  private async createWorkspaceMemoryFile(
+    filePath: string,
+  ): Promise<WorkspaceMemoryFile> {
+    const stat = await fs.stat(filePath);
+    const relativePath = path.relative(this.workspaceRoot!, filePath);
+    const language = this.inferLanguage(relativePath);
+    const role = this.inferFileRole(relativePath);
+    const content = stat.size <= 256 * 1024 ?
+      await fs.readFile(filePath, 'utf-8') :
+      '';
+
+    return {
+      path: relativePath,
+      language,
+      role,
+      size: stat.size,
+      imports: this.extractImportsForMemory(content, language).slice(0, 20),
+      symbols: this.extractSymbolsForMemory(content, language).slice(0, 30),
+      routes: this.extractRoutesForMemory(content).slice(0, 30),
+    };
+  }
+
+  private inferLanguage(relativePath: string): string {
+    const extension = path.extname(relativePath).toLowerCase();
+    const languageByExtension: Record<string, string> = {
+      '.cjs': 'javascript',
+      '.css': 'css',
+      '.html': 'html',
+      '.js': 'javascript',
+      '.jsx': 'javascript',
+      '.json': 'json',
+      '.md': 'markdown',
+      '.mjs': 'javascript',
+      '.py': 'python',
+      '.sh': 'shell',
+      '.toml': 'toml',
+      '.ts': 'typescript',
+      '.tsx': 'typescript',
+      '.txt': 'text',
+      '.yaml': 'yaml',
+      '.yml': 'yaml',
+    };
+    return languageByExtension[extension] || 'unknown';
+  }
+
+  private inferFileRole(relativePath: string): string {
+    const normalized = relativePath.toLowerCase();
+    const baseName = path.basename(normalized);
+    if (baseName === 'readme.md') {
+      return 'readme';
+    }
+    if (['package.json', 'pyproject.toml', 'requirements.txt'].includes(baseName)) {
+      return 'manifest';
+    }
+    if (['main.py', 'app.py', 'server.py', 'index.ts', 'main.ts'].includes(baseName)) {
+      return 'entrypoint';
+    }
+    if (normalized.includes('/test') || normalized.includes('/__tests__')) {
+      return 'test';
+    }
+    if (normalized.includes('deployment') || normalized.includes('deploy')) {
+      return 'deployment';
+    }
+    if (normalized.includes('config') || normalized.endsWith('.yaml') ||
+        normalized.endsWith('.yml') || normalized.endsWith('.toml')) {
+      return 'config';
+    }
+
+    return 'source';
+  }
+
+  private extractImportsForMemory(content: string, language: string): string[] {
+    if (!content) {
+      return [];
+    }
+
+    if (language === 'python') {
+      return this.extractMatches(
+        content,
+        /^\s*(?:from\s+([A-Za-z0-9_.]+)\s+import|import\s+([A-Za-z0-9_.]+))/gm,
+      );
+    }
+
+    if (language === 'typescript' || language === 'javascript') {
+      return this.extractMatches(
+        content,
+        /^\s*import\s+.+?from\s+['"](.+?)['"];?/gm,
+      );
+    }
+
+    return [];
+  }
+
+  private extractSymbolsForMemory(content: string, language: string): string[] {
+    if (!content) {
+      return [];
+    }
+
+    if (language === 'python') {
+      return [
+        ...this.extractMatches(content, /^\s*class\s+([A-Za-z0-9_]+)/gm),
+        ...this.extractMatches(
+          content,
+          /^\s*(?:async\s+)?def\s+([A-Za-z0-9_]+)\s*\(/gm,
+        ),
+      ];
+    }
+
+    if (language === 'typescript' || language === 'javascript') {
+      return [
+        ...this.extractMatches(
+          content,
+          /^\s*(?:export\s+)?class\s+([A-Za-z0-9_]+)/gm,
+        ),
+        ...this.extractMatches(
+          content,
+          /^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z0-9_]+)/gm,
+        ),
+      ];
+    }
+
+    return [];
+  }
+
+  private extractRoutesForMemory(content: string): string[] {
+    if (!content) {
+      return [];
+    }
+
+    return [
+      ...this.extractMatches(
+        content,
+        /^\s*@\w+\.(?:get|post|put|patch|delete)\(\s*['"](.+?)['"]/gm,
+      ),
+      ...this.extractMatches(
+        content,
+        /ipcMain\.handle\(\s*['"](.+?)['"]/gm,
+      ),
+    ];
+  }
+
+  private detectWorkspaceFrameworks(files: WorkspaceMemoryFile[]): string[] {
+    const frameworks = new Set<string>();
+    for (const file of files) {
+      const joined = [...file.imports, ...file.symbols, file.path]
+        .join(' ')
+        .toLowerCase();
+      if (joined.includes('fastapi')) {
+        frameworks.add('FastAPI');
+      }
+      if (joined.includes('flask')) {
+        frameworks.add('Flask');
+      }
+      if (joined.includes('django')) {
+        frameworks.add('Django');
+      }
+      if (joined.includes('aws_cdk') || joined.includes('aws-cdk')) {
+        frameworks.add('AWS CDK');
+      }
+      if (joined.includes('electron')) {
+        frameworks.add('Electron');
+      }
+    }
+
+    return Array.from(frameworks).sort();
+  }
+
+  private scoreMemoryFile(file: WorkspaceMemoryFile): number {
+    let score = this.scoreUsefulWorkspaceFile(
+      path.join(this.workspaceRoot!, file.path),
+      true,
+    );
+    if (file.role === 'readme') {
+      score += 80;
+    }
+    if (file.role === 'entrypoint') {
+      score += 45;
+    }
+    if (file.role === 'manifest') {
+      score += 35;
+    }
+    if (file.role === 'deployment') {
+      score -= 30;
+    }
+
+    return score;
+  }
+
+  private async createReadmeExcerpt(filePath: string): Promise<string> {
+    const content = await this.readTextFile(filePath);
+    return content
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith('```'))
+      .slice(0, 10)
+      .join('\n')
+      .slice(0, 1200);
+  }
+
+  private async formatWorkspaceMemoryForPrompt(): Promise<string> {
+    const memory = await this.ensureWorkspaceMemory();
+    if (!memory) {
+      return 'No workspace memory is available.';
+    }
+
+    const lines = [
+      `updatedAt: ${memory.updatedAt}`,
+      `languages: ${memory.languages.join(', ') || 'unknown'}`,
+      `frameworks: ${memory.frameworks.join(', ') || 'unknown'}`,
+      `importantFiles: ${memory.importantFiles.slice(0, 12).join(', ') || 'none'}`,
+    ];
+    if (memory.readmePath) {
+      lines.push(`readmePath: ${memory.readmePath}`);
+    }
+    if (memory.readmeExcerpt) {
+      lines.push(`readmeExcerpt: ${this.truncateText(memory.readmeExcerpt, 900)}`);
+    }
+
+    const symbolLines = memory.files
+      .filter((file) => file.symbols.length > 0 || file.routes.length > 0)
+      .slice(0, 12)
+      .map((file) => {
+        const details = [
+          file.symbols.length > 0 ? `symbols=${file.symbols.slice(0, 8).join(',')}` : '',
+          file.routes.length > 0 ? `routes=${file.routes.slice(0, 8).join(',')}` : '',
+        ].filter(Boolean).join(' ');
+        return `- ${file.path}: ${details}`;
+      });
+    if (symbolLines.length > 0) {
+      lines.push('indexedSymbols:', ...symbolLines);
+    }
+
+    return lines.join('\n');
+  }
+
+  private async loadWorkspaceMemory(): Promise<WorkspaceMemory | null> {
+    try {
+      const memoryPath = this.getWorkspaceMemoryPath();
+      const content = await fs.readFile(memoryPath, 'utf-8');
+      return JSON.parse(content) as WorkspaceMemory;
+    } catch {
+      return null;
+    }
+  }
+
+  private async saveWorkspaceMemory(memory: WorkspaceMemory): Promise<void> {
+    const memoryPath = this.getWorkspaceMemoryPath();
+    await fs.mkdir(path.dirname(memoryPath), { recursive: true });
+    await fs.writeFile(memoryPath, JSON.stringify(memory, null, 2), 'utf-8');
+  }
+
+  private getWorkspaceMemoryPath(): string {
+    if (!this.workspaceRoot) {
+      throw new Error('No workspace is open.');
+    }
+
+    const key = createHash('sha256')
+      .update(path.resolve(this.workspaceRoot))
+      .digest('hex')
+      .slice(0, 24);
+    return path.join(app.getPath('userData'), 'workspace-memory', `${key}.json`);
   }
 
   private truncateObservation(content: string): string {
     const maxLength = 5000;
+    return this.truncateText(content, maxLength);
+  }
+
+  private truncateText(content: string, maxLength: number): string {
     if (content.length <= maxLength) {
       return content;
     }
@@ -1616,6 +2285,25 @@ class MainApp {
       );
 
     return scored.slice(0, 6).map((candidate) => candidate.filePath);
+  }
+
+  private async findBestFilesInDirectory(directoryPath: string): Promise<string[]> {
+    if (!this.workspaceRoot) {
+      return [];
+    }
+
+    const files = await this.collectWorkspaceFiles(directoryPath);
+    return files
+      .map((filePath) => ({
+        filePath: path.relative(this.workspaceRoot!, filePath),
+        score: this.scoreUsefulWorkspaceFile(filePath, true),
+      }))
+      .sort((left, right) =>
+        right.score - left.score ||
+        left.filePath.localeCompare(right.filePath),
+      )
+      .slice(0, 8)
+      .map((candidate) => candidate.filePath);
   }
 
   private scoreSimilarPath(
