@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NMFA IDE</title>
+    <style>
+      body {
+        margin: 0;
+        padding: 0;
+        font-family: system-ui, sans-serif;
+        background: #121212;
+        color: #f0f0f0;
+      }
+
+      .toolbar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 12px;
+        background: #181818;
+        border-bottom: 1px solid #333;
+      }
+
+      .toolbar button {
+        padding: 10px 14px;
+        background: #0b5fff;
+        color: white;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+
+      .toolbar button:hover {
+        background: #0a4de0;
+      }
+
+      .status-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 12px 12px;
+        color: #b0b0b0;
+      }
+
+      .workspace {
+        display: flex;
+        height: calc(100vh - 92px);
+      }
+
+      #editor {
+        flex: 1;
+        border-right: 1px solid #333;
+        background: #1e1e1e;
+        overflow: hidden;
+      }
+
+      #chat-container {
+        width: 420px;
+        min-width: 320px;
+        display: flex;
+        flex-direction: column;
+        background: #151515;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="toolbar">
+      <button id="open-file">Open File</button>
+      <button id="open-folder">Open Folder</button>
+      <button id="save-file">Save File</button>
+      <button id="start-model">Start Model</button>
+      <span id="model-status">Model status: unknown</span>
+    </div>
+
+    <div class="status-bar">
+      <div id="current-file">No file open</div>
+      <div id="app-version"></div>
+    </div>
+
+    <div class="workspace">
+      <div id="editor"></div>
+      <div id="chat-container"></div>
+    </div>
+
+    <script>
+      if (typeof require === 'function') {
+        require('./renderer.js');
+      } else {
+        console.error('Unable to load renderer: require is not available.');
+      }
+    </script>
+  </body>
+</html>
